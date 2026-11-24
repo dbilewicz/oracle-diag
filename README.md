@@ -151,8 +151,40 @@ opcje:
   --timeout SECS          Timeout TCP (domyślnie: 10)
   --config FILE           Plik konfiguracyjny INI
   --no-diag               Tylko test połączenia, bez diagnostyki
+  --urg-test              Check whether TCP segments with the URG flag reach the server (Linux only)
+  --disable-oob           Connect without the out-of-band break check (thin mode only)
   --generate-config       Wygeneruj przykładowy oracle_diag.ini
 ```
+
+### URG / out-of-band check (`--urg-test`)
+
+Oracle thin drivers (JDBC thin, python-oracledb thin) send one TCP urgent byte
+(URG flag) during connect as an out-of-band break check. Some firewalls drop such
+segments; the client then hangs on its first read until the server resets the
+connection after `INBOUND_CONNECT_TIMEOUT` (60 s by default).
+
+```bash
+python3 oracle_diag.py --config oracle_diag.ini --urg-test --no-diag
+```
+
+The probe opens a TCP connection to the listener, sends one plain byte as a control
+and then one urgent byte, and reads the kernel ACK state via `TCP_INFO`. No root
+privileges are needed. Possible results:
+
+- `✓ Urgent (URG) segment acknowledged`: URG passes the network path.
+- `✗ Urgent (URG) segment NOT acknowledged`: plain data passes, URG is dropped.
+  Workarounds: `oracle.net.disableOob=true` (JDBC), `--disable-oob` /
+  `disable_oob=True` (python-oracledb), `DISABLE_OOB=ON` in the server `sqlnet.ora`.
+  Root fix: allow the URG flag for port 1521 on the firewall.
+- `? inconclusive`: even plain data was not acknowledged.
+
+Notes:
+
+- Run it from the application network (the same host or container as the app).
+- With SCAN or listener redirects, the client finally connects to a node address.
+  Run the test with `--host` set to each node IP, not only the SCAN address.
+- The listener receives an incomplete TNS packet and may log an error in `listener.log`.
+- A firewall that clears the URG flag instead of dropping the segment is not detected.
 
 ### Tylko test połączenia (bez pełnej diagnostyki)
 

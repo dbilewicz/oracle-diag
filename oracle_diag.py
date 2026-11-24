@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import socket
+import struct
 from pathlib import Path
 
 # ── Wartości domyślne ────────────────────────────────────────────────────────
@@ -36,6 +37,12 @@ DEFAULTS = {
 }
 
 SCRIPT_DIR = Path(__file__).parent
+
+# Linux struct tcp_info prefix: 8 x u8, then u32 fields up to tcpi_total_retrans.
+TCP_INFO_FORMAT = "8B24I"
+TCP_INFO_UNACKED = 8 + 4
+TCP_INFO_TOTAL_RETRANS = 8 + 23
+URG_ACK_WAIT_SECONDS = 5.0
 
 
 # ── Ładowanie konfiguracji ───────────────────────────────────────────────────
@@ -129,7 +136,71 @@ def test_tcp(host, port, timeout):
         return False
 
 
-def connect_oracle(cfg):
+def read_tcp_ack_state(sock):
+    """Return (unacked_segments, total_retransmissions) from Linux TCP_INFO."""
+    size = struct.calcsize(TCP_INFO_FORMAT)
+    fields = struct.unpack(TCP_INFO_FORMAT, sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, size))
+    return fields[TCP_INFO_UNACKED], fields[TCP_INFO_TOTAL_RETRANS]
+
+
+def wait_for_ack(sock, wait_seconds):
+    """Poll until every sent segment is acknowledged; return (acked, total_retransmissions)."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        unacked, retransmissions = read_tcp_ack_state(sock)
+        if unacked == 0:
+            return True, retransmissions
+        if time.monotonic() >= deadline:
+            return False, retransmissions
+        time.sleep(0.1)
+
+
+def test_urgent_data(host, port, timeout):
+    """
+    Check whether a TCP segment with the URG flag reaches the server.
+
+    Oracle thin drivers send one urgent byte during connect (out-of-band break check).
+    Some firewalls drop such segments, leaving the session hanging until the server
+    resets it (INBOUND_CONNECT_TIMEOUT). The probe sends a plain byte as a control,
+    then one urgent byte, and reads kernel ACK state via TCP_INFO (Linux only).
+    The listener receives an incomplete TNS packet and may log an error.
+    """
+    print(f"\n[URG] {host}:{port} ...", end=" ", flush=True)
+    if not sys.platform.startswith("linux") or not hasattr(socket, "TCP_INFO"):
+        print("skipped (requires Linux TCP_INFO)")
+        return None
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            sock.send(b"\x00")
+            control_acked, _ = wait_for_ack(sock, URG_ACK_WAIT_SECONDS)
+            if not control_acked:
+                print(f"? inconclusive: plain data not acknowledged within {URG_ACK_WAIT_SECONDS:.0f}s")
+                return None
+
+            _, retransmissions_before = read_tcp_ack_state(sock)
+            sock.send(b"\x00", socket.MSG_OOB)
+            urgent_acked, retransmissions_after = wait_for_ack(sock, URG_ACK_WAIT_SECONDS)
+    except OSError as e:
+        print(f"? inconclusive: {e}")
+        return None
+
+    urgent_retransmissions = retransmissions_after - retransmissions_before
+    if urgent_acked:
+        print(f"✓ Urgent (URG) segment acknowledged (retransmissions: {urgent_retransmissions})")
+        return True
+
+    print(f"✗ Urgent (URG) segment NOT acknowledged within {URG_ACK_WAIT_SECONDS:.0f}s "
+          f"(retransmissions: {urgent_retransmissions}); plain data was acknowledged")
+    print("  A device on the path most likely drops TCP segments with the URG flag.")
+    print("  Workarounds: JDBC oracle.net.disableOob=true, python-oracledb disable_oob=True,")
+    print("  server sqlnet.ora DISABLE_OOB=ON. Root fix: allow the URG flag on port 1521.")
+    return False
+
+
+def connect_oracle(cfg, disable_oob=False):
     try:
         import oracledb
     except ImportError:
@@ -157,10 +228,18 @@ def connect_oracle(cfg):
         print("✗ Podaj --sid lub --service-name")
         sys.exit(1)
 
+    connect_options = {}
+    if disable_oob:
+        if cfg["instant_client"]:
+            print("[ORA] --disable-oob applies to thin mode only; set DISABLE_OOB=ON in client sqlnet.ora for thick mode")
+        else:
+            print("[ORA] Out-of-band break check disabled (disable_oob=True)")
+            connect_options["disable_oob"] = True
+
     print(f"[ORA] Łączenie z {dsn} jako {cfg['user']} ...", end=" ", flush=True)
     try:
         start = time.time()
-        conn = oracledb.connect(user=cfg["user"], password=cfg["password"], dsn=dsn)
+        conn = oracledb.connect(user=cfg["user"], password=cfg["password"], dsn=dsn, **connect_options)
         elapsed = time.time() - start
         print(f"✓ OK ({elapsed:.2f}s)")
         return conn, dsn
@@ -267,6 +346,10 @@ Przykłady:
     other = p.add_argument_group("Inne")
     other.add_argument("--config",        metavar="FILE",      help="Plik konfiguracyjny INI (domyślnie: oracle_diag.ini)")
     other.add_argument("--no-diag",       action="store_true", help="Tylko test połączenia, bez pełnej diagnostyki")
+    other.add_argument("--urg-test",      action="store_true", dest="urg_test",
+                       help="Check whether TCP segments with the URG flag reach the server (Linux only)")
+    other.add_argument("--disable-oob",   action="store_true", dest="disable_oob",
+                       help="Connect without the out-of-band break check (thin mode only)")
     other.add_argument("--generate-config", action="store_true", help="Wygeneruj przykładowy plik oracle_diag.ini i zakończ")
 
     return p
@@ -322,7 +405,12 @@ def main():
         print("\n⚠  Port niedostępny – sprawdź firewall / adres IP.")
         sys.exit(1)
 
-    conn, dsn = connect_oracle(cfg)
+    if args.urg_test:
+        urgent_ok = test_urgent_data(cfg["host"], cfg["port"], cfg["timeout"])
+        if urgent_ok is False and not args.disable_oob:
+            print("  ⚠  The connect below may hang until the server resets it; consider --disable-oob.")
+
+    conn, dsn = connect_oracle(cfg, disable_oob=args.disable_oob)
 
     if not args.no_diag:
         run_diagnostics(conn, cfg["user"])
